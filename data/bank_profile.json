@@ -1,0 +1,138 @@
+{
+  "meta": {
+    "bank_id": "MIDUS-001",
+    "name": "PoC Midsize US Bank",
+    "type": "synthetic_poc",
+    "jurisdiction": "US",
+    "currency": "USD",
+    "created_by": "AI-Chief-Treasury-Officer (PoC)",
+    "created_on": "2025-10-11",
+    "notes": "Template PoC bank profile. Replace with production bank_profile before production runs."
+  },
+
+  "targets": {
+    "lcr_target": 1.00,
+    "lcr_buffer_pct": 0.25,
+    "nsfr_target": 1.00
+  },
+
+  "reporting_snapshot": {
+    "as_of": "2025-10-15",
+    "currency": "USD"
+  },
+
+  "liquidity": {
+    "net_outflows_30d_usd": 3000000000.0,
+    "total_hqla_usd": 3000000000.0,
+    "hqla_breakdown": {
+      "Level 1": {
+        "amount_usd": 2400000000.0,
+        "haircut": 0.00,
+        "notes": "Central bank reserves + sovereign cash"
+      },
+      "Level 2A": {
+        "amount_usd": 600000000.0,
+        "haircut": 0.15,
+        "notes": "High quality corporate bonds, covered bonds"
+      },
+      "Level 2B": {
+        "amount_usd": 0.0,
+        "haircut": 0.50,
+        "notes": "Illiquid lower quality assets (set to 0 for PoC buffer fit)"
+      }
+    },
+
+    "lcr_current": 1.0,
+    "lcr_calc_method": "total_hqla_usd / net_outflows_30d_usd",
+    "survival_days": 30.0,
+    "survival_calc_method": "30 * total_hqla_usd / net_outflows_30d_usd"
+  },
+
+  "market_risk": {
+    "var": {
+      "var_1d_99_usd": 1000000000.0,
+      "var_10d_99_usd": 3162277660.17,
+      "method": "historical_sim",
+      "holding": "trading_book"
+    },
+    "stress_parameters": {
+      "alpha_anchor": 0.15,
+      "beta_anchor": 0.05,
+      "mapping_notes": "Anchors derived from recent market snapshot for PoC. alpha = % increase in 30d net outflows, beta = % reduction in usable HQLA"
+    }
+  },
+
+  "counterparty_limits": {
+    "per_counterparty_max_usd": 250000000.0,
+    "per_group_max_usd": 500000000.0,
+    "short_term_funding_limit_usd": 1000000000.0
+  },
+
+  "funding_profile": {
+    "repo_capacity_usd": 1500000000.0,
+    "committed_lines_usd": 800000000.0,
+    "central_bank_access": true,
+    "eligible_instruments": [
+      "US_Treasury",
+      "Agency_MBS",
+      "Covered_Bonds",
+      "Short_Dated_Corporates",
+      "Cash"
+    ]
+  },
+
+  "governance": {
+    "validation_rules": {
+      "require_hqla_and_netout": true,
+      "require_lcr_consistency": true,
+      "allow_survival_override": true
+    },
+    "provenance": {
+      "author": "AI-PoC",
+      "version": "1.0",
+      "immutable": false
+    },
+    "seeds": {
+      "scenario_seed": 20251011
+    },
+    "poc": {
+      "inflow_fraction_available_under_stress": 0.20
+    }
+  },
+
+  "simulated_baseline": {
+    "note": "PoC deterministic simulated near-term cashflows added to demonstrate worst-10bd outflow for presentation. Remove or replace with AI-generated shocks for production.",
+    "cashflows": [
+      {
+        "id": "poc_retail_withdrawal_1",
+        "date": "2025-10-16",
+        "currency": "USD",
+        "amount": -333333333.33,
+        "direction": "out",
+        "product": "retail_deposits",
+        "counterparty_id": "retail_segment",
+        "notes": "Simulated concentrated retail withdrawal (PoC demo)"
+      },
+      {
+        "id": "poc_retail_withdrawal_2",
+        "date": "2025-10-20",
+        "currency": "USD",
+        "amount": -333333333.33,
+        "direction": "out",
+        "product": "retail_deposits",
+        "counterparty_id": "retail_segment",
+        "notes": "Simulated concentrated retail withdrawal (PoC demo)"
+      },
+      {
+        "id": "poc_wholesale_call_1",
+        "date": "2025-10-25",
+        "currency": "USD",
+        "amount": -333333333.34,
+        "direction": "out",
+        "product": "wholesale_funding",
+        "counterparty_id": "wholesale_segment",
+        "notes": "Simulated wholesale funding recall (PoC demo)"
+      }
+    ]
+  }
+}
