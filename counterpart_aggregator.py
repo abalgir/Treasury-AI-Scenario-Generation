@@ -290,18 +290,20 @@ def aggregate_portfolio_intel(
     print(f"[aggregator] Saved to {CACHE_FILE}")
     return intel
 
-
-if __name__ == "__main__":
+def main():
     """
-    CLI test: Run aggregator (respects cache)
-    - Calls aggregate_portfolio_intel() with defaults.
-    - Dumps full JSON to stdout (indented, str for datetimes).
-    - Use: python counterpart_aggregator.py > test_intel.json for validation.
+        CLI test: Run aggregator (respects cache)
+        - Calls aggregate_portfolio_intel() with defaults.
+        - Dumps full JSON to stdout (indented, str for datetimes).
+        - Use: python counterpart_aggregator.py > test_intel.json for validation.
 
-    PoC Usage:
-        - Integrates with orchestrator: intel = aggregate_portfolio_intel(); prompt = f"Analyze: {intel['cashflow_agg']}"
-        - For Streamlit: st.metric('CPs', intel['cp_count']); st.text(intel['hql_by_level'])
-    """
+        PoC Usage:
+            - Integrates with orchestrator: intel = aggregate_portfolio_intel(); prompt = f"Analyze: {intel['cashflow_agg']}"
+            - For Streamlit: st.metric('CPs', intel['cp_count']); st.text(intel['hql_by_level'])
+        """
     # CLI test: Run aggregator (respects cache)
     intel = aggregate_portfolio_intel()
     print(json.dumps(intel, indent=2, default=str))
+
+if __name__ == "__main__":
+    main()

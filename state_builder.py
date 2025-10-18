@@ -527,30 +527,28 @@ def build_state(portfolio: Dict[str, Any], bank_profile: Dict[str, Any], shocks:
     return state
 
 
-# CLI entrypoint writes file
-# Chains workflow: loads inputs, builds/writes state.json for reproducibility.
-if __name__ == "__main__":
+def main():
     """
-    CLI: python state_builder.py
+        CLI: python state_builder.py
 
-    Loads:
-        - portfolio_view.json: Aggregated positions/cashflows.
-        - bank_profile.json: Liquidity/risk profile.
-        - exchange_rate.json: FX map (optional; merges into portfolio).
+        Loads:
+            - portfolio_view.json: Aggregated positions/cashflows.
+            - bank_profile.json: Liquidity/risk profile.
+            - exchange_rate.json: FX map (optional; merges into portfolio).
 
-    Writes:
-        - state.json: Canonical output for downstream modules.
+        Writes:
+            - state.json: Canonical output for downstream modules.
 
-    Behavior:
-        - Handles missing FX file gracefully.
-        - Serializes datetimes as strings for JSON compatibility.
-        - Prints success path; errors surface via build_state.
+        Behavior:
+            - Handles missing FX file gracefully.
+            - Serializes datetimes as strings for JSON compatibility.
+            - Prints success path; errors surface via build_state.
 
-    PoC Notes:
-        - Run after portfolio_aggregator.py.
-        - For testing: Inspect state.json LCR/survival_days.
-        - Extends to shocks via build_state(..., shocks={'rate': +200}).
-    """
+        PoC Notes:
+            - Run after portfolio_aggregator.py.
+            - For testing: Inspect state.json LCR/survival_days.
+            - Extends to shocks via build_state(..., shocks={'rate': +200}).
+        """
     base_dir = DATA_DIR
     portfolio_file = base_dir / "portfolio_view.json"
     bank_profile_file = base_dir / "bank_profile.json"
@@ -570,3 +568,8 @@ if __name__ == "__main__":
     with open(out_file, "w") as f:
         json.dump(state, f, indent=2, default=str)
     print(f"[STATE_BUILDER] Saved state to {out_file}")
+
+# CLI entrypoint writes file
+# Chains workflow: loads inputs, builds/writes state.json for reproducibility.
+if __name__ == "__main__":
+    main()

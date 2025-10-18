@@ -65,7 +65,7 @@ from with_whom.infra.json_utils import parse_strict_json
 
 print("[macro_ai] loaded v2025-10-12R5")  # trace
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 OUTPUT_FILE = DATA_DIR / "standalone_scenarios.json"  # New: For standalone test results
 
 # ----------------------------- SCHEMA ----------------------------- #

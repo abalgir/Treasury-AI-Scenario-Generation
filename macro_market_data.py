@@ -223,18 +223,20 @@ def aggregate_macro_data(
     print(f"[macro_data] Saved to {CACHE_FILE}")
     return data
 
-
-if __name__ == "__main__":
+def main():
     """
-    CLI test: Run aggregator (PoC fake mode)
-    - Calls aggregate_macro_data(use_fake=True) with default as_of.
-    - Dumps full JSON to stdout (indented, str for datetimes).
-    - Use: python macro_market_data.py > test_macro.json for validation.
+       CLI test: Run aggregator (PoC fake mode)
+       - Calls aggregate_macro_data(use_fake=True) with default as_of.
+       - Dumps full JSON to stdout (indented, str for datetimes).
+       - Use: python macro_market_data.py > test_macro.json for validation.
 
-    PoC Usage:
-        - Integrates with orchestrator: macro = aggregate_macro_data(); prompt = f"Generate shocks based on CPI {macro['cpi_us']}%".
-        - For Streamlit: st.json(macro) or st.metric('US 10y Yield', f"{macro['us_treasury_rates']['year10']}%").
-    """
+       PoC Usage:
+           - Integrates with orchestrator: macro = aggregate_macro_data(); prompt = f"Generate shocks based on CPI {macro['cpi_us']}%".
+           - For Streamlit: st.json(macro) or st.metric('US 10y Yield', f"{macro['us_treasury_rates']['year10']}%").
+       """
     # CLI test: Run aggregator (PoC fake mode)
     macro = aggregate_macro_data(use_fake=True)
     print(json.dumps(macro, indent=2, default=str))
+
+if __name__ == "__main__":
+   main()

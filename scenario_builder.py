@@ -642,26 +642,58 @@ def clamp_into_window(as_of_d: date, d: date) -> date:
     if d > hi: return hi
     return d
 
+# ---------- Liquidity shocks (robust) ----------
+def _coerce_shock_map(raw, cast=float):
+    """
+    Coerce a shocks input into a mapping of UPPERCASE keys -> cast(value).
+    Accepts:
+      - dict like {'USD': 0.5, 'EUR': 0.6}
+      - scalar like 3 or "3" -> becomes {'*': cast(3)}
+      - None -> {}
+    'cast' can be int or float depending on expected type.
+    """
+    out = {}
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                key = str(k).upper()
+                out[key] = cast(v)
+            except Exception:
+                # ignore unparseable entries
+                continue
+        return out
+    # scalar -> treat as global default
+    try:
+        out["*"] = cast(raw)
+    except Exception:
+        pass
+    return out
+
+
 def apply_liquidity_shocks_to_flows(flows: List[dict], shocks: dict, as_of_d: date, audit: List[str]) -> Tuple[List[dict], Dict[str, Any]]:
     """
     Apply liquidity shocks to flows.
 
-    Args:
-        flows: List of cashflows.
-        shocks: Dict of shocks.
-        as_of_d: As-of date.
-        audit: List for audit notes.
+    Behaviour (compatible with old API):
+      - shocks may supply per-currency dicts OR a scalar (applies to all currencies).
+      - when looking up currency-specific values, prefer exact currency key, otherwise use '*' (global).
+      - keeps original clamping to as_of+1 .. as_of+30 window for date shifts.
 
     Returns:
-        Tuple: Modified flows, shock summary.
+      - modified flows list (in-place edits applied to provided list),
+      - summary dict describing applied shocks.
     """
     summary = {"ccy_inflow_mult": {}, "ccy_outflow_mult": {}, "payment_delay_days": {}, "outflow_accelerate_days": {}}
-    if not flows: return flows, summary
+    if not flows:
+        return flows, summary
 
-    inflow_mult = {k.upper(): float(v) for k, v in (shocks.get("ccy_inflow_mult") or {}).items()}
-    outflow_mult = {k.upper(): float(v) for k, v in (shocks.get("ccy_outflow_mult") or {}).items()}
-    pay_delay = {k.upper(): int(v) for k, v in (shocks.get("payment_delay_days") or {}).items()}
-    out_accel = {k.upper(): int(v) for k, v in (shocks.get("outflow_accelerate_days") or {}).items()}
+    # Coerce incoming shock specs safely (accept dicts or scalars)
+    inflow_mult_map  = _coerce_shock_map(shocks.get("ccy_inflow_mult"), float)
+    outflow_mult_map = _coerce_shock_map(shocks.get("ccy_outflow_mult"), float)
+    pay_delay_map    = _coerce_shock_map(shocks.get("payment_delay_days"), int)
+    out_accel_map    = _coerce_shock_map(shocks.get("outflow_accelerate_days"), int)
 
     touched_examples = []
 
@@ -670,33 +702,58 @@ def apply_liquidity_shocks_to_flows(flows: List[dict], shocks: dict, as_of_d: da
         try:
             fd = _to_date(f.get("date"))
         except Exception:
+            # skip if date cannot be parsed
             continue
         sgn = _sign_from_direction(f)
 
-        if sgn > 0 and ccy in inflow_mult:
-            before = float(f.get("amount", 0.0))
-            f["amount"] = before * inflow_mult[ccy]
-            summary["ccy_inflow_mult"][ccy] = inflow_mult[ccy]
-            if len(touched_examples) < 5:
-                touched_examples.append({"currency": ccy, "direction": "inflow", "amount_before": before, "after": f["amount"], "date": str(fd)})
+        # helper: lookup from map, prefer exact ccy, else global '*', else None
+        def _lookup(m):
+            if not m:
+                return None
+            return m.get(ccy) if ccy in m else m.get("*")
 
-        if sgn < 0 and ccy in outflow_mult:
-            before = float(f.get("amount", 0.0))
-            f["amount"] = before * outflow_mult[ccy]
-            summary["ccy_outflow_mult"][ccy] = outflow_mult[ccy]
-            if len(touched_examples) < 5:
-                touched_examples.append({"currency": ccy, "direction": "outflow", "amount_before": before, "after": f["amount"], "date": str(fd)})
+        # inflow multiplier
+        if sgn > 0:
+            mult = _lookup(inflow_mult_map)
+            if mult is not None:
+                try:
+                    before = float(f.get("amount", 0.0))
+                except Exception:
+                    before = 0.0
+                f["amount"] = before * float(mult)
+                summary["ccy_inflow_mult"][ccy] = mult if ccy in inflow_mult_map else inflow_mult_map.get("*")
+                if len(touched_examples) < 5:
+                    touched_examples.append({"currency": ccy, "direction": "inflow", "amount_before": before, "after": f["amount"], "date": str(fd)})
 
-        if sgn > 0 and ccy in pay_delay and pay_delay[ccy] != 0:
-            newd = clamp_into_window(as_of_d, fd + timedelta(days=pay_delay[ccy]))
+        # outflow multiplier
+        if sgn < 0:
+            mult = _lookup(outflow_mult_map)
+            if mult is not None:
+                try:
+                    before = float(f.get("amount", 0.0))
+                except Exception:
+                    before = 0.0
+                f["amount"] = before * float(mult)
+                summary["ccy_outflow_mult"][ccy] = mult if ccy in outflow_mult_map else outflow_mult_map.get("*")
+                if len(touched_examples) < 5:
+                    touched_examples.append({"currency": ccy, "direction": "outflow", "amount_before": before, "after": f["amount"], "date": str(fd)})
+
+        # payment delay for inflows (use global default if provided)
+        delay = _lookup(pay_delay_map)
+        if sgn > 0 and delay is not None and int(delay) != 0:
+            newd = clamp_into_window(as_of_d, fd + timedelta(days=int(delay)))
             if newd != fd:
                 f["date"] = newd.isoformat()
-                summary["payment_delay_days"][ccy] = pay_delay[ccy]
-        if sgn < 0 and ccy in out_accel and out_accel[ccy] != 0:
-            newd = clamp_into_window(as_of_d, fd - timedelta(days=abs(out_accel[ccy])))
+                # record the effective value under the currency key used (exact or '*')
+                summary["payment_delay_days"][ccy] = int(delay) if ccy in pay_delay_map else pay_delay_map.get("*")
+
+        # outflow acceleration (move earlier) for outflows
+        accel = _lookup(out_accel_map)
+        if sgn < 0 and accel is not None and int(accel) != 0:
+            newd = clamp_into_window(as_of_d, fd - timedelta(days=abs(int(accel))))
             if newd != fd:
                 f["date"] = newd.isoformat()
-                summary["outflow_accelerate_days"][ccy] = out_accel[ccy]
+                summary["outflow_accelerate_days"][ccy] = int(accel) if ccy in out_accel_map else out_accel_map.get("*")
 
     audit.append(f"Liquidity shocks applied: examples={touched_examples}")
     return flows, summary

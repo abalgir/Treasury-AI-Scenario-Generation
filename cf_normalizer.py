@@ -1,63 +1,18 @@
+#!/usr/bin/env python3
 # cf_normalizer.py
 # Drop-in normalizer for state_builder.build_state(...)
-# - Matches signature used by: from with_whom.dashboard.cf_normalizer import normalize_cashflows
 # - Returns a pandas.DataFrame with normalized columns.
-# - Does NOT add HQLA reserves as cashflows (handled in metrics via intraday_liquidity).
-
-"""
-Cashflow Normalizer for Treasury AI Proof-of-Concept (PoC)
-
-Module Overview:
-----------------
-This module provides a robust, drop-in normalizer for heterogeneous cashflow data ingested into the Treasury AI workflow.
-It harmonizes disparate schemas from upstream systems (e.g., Murex, Calypso exports) into a canonical pandas DataFrame,
-ensuring consistent date coercion, currency standardization, amount signing (inflow/outflow convention),
-and basic cleanup/deduplication. Designed for Basel III LCR/NSFR computations in state_builder.py.
-
-Key Features:
--------------
-- Handles mixed dict schemas: Maps aliases (e.g., 'ccy' → 'currency', 'amt' → 'amount').
-- Enforces sign convention: + for inflows (RECEIVE/IN), - for outflows (PAY/OUT).
-- Date normalization: Coerces to datetime, filters historical if requested.
-- Defensive parsing: Regex for amounts (handles commas, embedded text), defaults for missing fields.
-- Audit-friendly: Preserves extra columns; derives instrument_id if absent (e.g., PRODUCT-CCY-DATE-SEQ).
-- No side effects: Does not inject HQLA/reserves (separate in bank_profile.intraday_liquidity).
-
-Regulatory Alignment:
----------------------
-- Supports LCR bucketing (30-day horizon) by standardizing 'date' and signed 'amount'.
-- Currency uppercasing/3-char default (USD) aids multi-FX aggregation per Dodd-Frank/CRD IV.
-- Deduplication prevents double-counting in liquidity ladders.
-
-Dependencies:
--------------
-- Python 3.8+: typing, datetime, re (standard library).
-- pandas: DataFrame manipulation and date/amount coercion.
-
-Usage in Workflow:
-------------------
-- Called by state_builder.build_state() post-harvest.
-- Input: Raw list[dict] from portfolio_view.json (top-level, nested, counterparty-specific).
-- Output: DataFrame → to_dict('records') for JSON serialization in state.json.
-- Example: df = normalize_cashflows(raw_cfs, as_of='2025-10-17', include_historical_cashflows=False)
-
-Integration Notes:
-------------------
-- For production: Extend with FX conversion (via portfolio.fx_rates) and regulatory runoff rates.
-- Streamlit: Use df for interactive liquidity ladders (e.g., st.dataframe(df[df['date'] <= horizon_end])).
-- Testing: Verify signing: inflows >0, outflows <0; no NaT/NaN in core columns.
-
-Author:
--------
-FintekMinds TreasuryAI PoC — Data Harmonization Module
-Version: 2025-10 (Schema-robust for PoC ingestion)
-"""
+# - Ensures returned DataFrame has unique column names so df.to_dict(...) doesn't omit data.
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Union
 from datetime import datetime, date
 import re
+import json
+import sys
+import traceback
+from pathlib import Path
 
 import pandas as pd
 
@@ -75,49 +30,7 @@ def normalize_cashflows(
     Normalize heterogeneous cashflow rows to a clean DataFrame with at least:
         ['date','currency','amount','product','type','counterparty_id','instrument_id','description']
 
-    Parameters
-    ----------
-    cashflows : list of dict
-        Raw cashflow rows (mixed schemas acceptable). Expected keys vary (e.g., 'flow_amount', 'value_date').
-        Nested 'cashflows' in dicts auto-flattened.
-    portfolio_view : dict, optional
-        Full portfolio dict (not required; kept for parity with caller). Unused here but extensible (e.g., FX rates).
-    bank_profile : dict, optional
-        Bank profile (intraday reserves, limits, etc.). We do NOT inject reserves here—handled in LCR metrics.
-    as_of : str | date | datetime, optional
-        Cutover date for optional filtering. If not provided, no date-based filtering is applied.
-        Format: ISO 'YYYY-MM-DD' or datetime; coerced via pd.to_datetime.
-    include_historical_cashflows : bool
-        If False, drops rows strictly before `as_of`. Useful for forward-looking LCR (excludes settled flows).
-
-    Returns
-    -------
-    pandas.DataFrame
-        Cleaned dataframe. Missing non-critical fields are filled with defaults (e.g., '' for strings, NaN for amounts).
-        Columns ordered: core first (date, currency, amount, ...), then extras. Index reset.
-
-    Process:
-        1. To DataFrame: Handles list[dict] or accidental dict{'cashflows': [...]}.
-        2. Schema mapping: Aliases → canonical (case-insensitive).
-        3. Date coercion: pd.to_datetime, normalize to date-only.
-        4. Currency: Upper, strip, default 'USD'.
-        5. Amount: Float parse (regex for embedded nums), sign by direction (+in/-out).
-        6. Filter: Drop no-date/zero-amount; optional historical cutoff.
-        7. Defaults: Ensure required cols (product='', etc.); derive instrument_id.
-        8. Dedupe: Exact matches on core keys.
-        9. Order: ['date', 'currency', 'amount', 'product', 'type', 'counterparty_id', 'instrument_id', 'description', 'direction'] + extras.
-
-    Raises:
-        None: Defensive; returns empty df on errors.
-
-    Example:
-        >>> raw = [{'date': '2025-10-18', 'amt': '1,000.50 USD', 'dir': 'IN'}]
-        >>> df = normalize_cashflows(raw)
-        >>> df['amount'].iloc[0]  # 1000.50 (positive inflow)
-
-    Compliance Notes:
-        - Signed amounts align with Basel III: +inflows (75% runoff cap), -outflows (3-100% rates).
-        - For NSFR: Extend filter to 1-year horizon.
+    Returns a DataFrame whose columns are guaranteed unique (duplicates renamed with __dupN).
     """
     df = _to_dataframe(cashflows)
 
@@ -126,6 +39,9 @@ def normalize_cashflows(
 
     # 1) Standardize columns and types
     df = _standardize_schema(df)
+
+    # Ensure unique column names (prevents pandas warnings and df.to_dict omissions)
+    df = _ensure_unique_columns(df)
 
     # 2) Parse & coerce dates
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
@@ -156,7 +72,7 @@ def normalize_cashflows(
         if as_of_ts is not None:
             df = df[df["date"] >= as_of_ts]
 
-    # 7) Ensure required columns exist with safe defaults
+    # 7) Ensure required columns exist with safe defaults (after unique-ification)
     for col, default in [
         ("product", ""),
         ("type", ""),
@@ -169,13 +85,17 @@ def normalize_cashflows(
         df[col] = df[col].fillna(default)
 
     # 8) Light de-duplication (exact duplicates only)
-    df = df.drop_duplicates(subset=["date", "currency", "amount", "product", "type", "counterparty_id", "instrument_id", "description"])
+    drop_subset = [c for c in ["date", "currency", "amount", "product", "type", "counterparty_id", "instrument_id", "description"] if c in df.columns]
+    if drop_subset:
+        df = df.drop_duplicates(subset=drop_subset)
 
     # 9) Final column order (keeps extra columns too)
     base_cols = ["date", "currency", "amount", "product", "type", "counterparty_id", "instrument_id", "description", "direction"]
     ordered = [c for c in base_cols if c in df.columns] + [c for c in df.columns if c not in base_cols]
     df = df.loc[:, ordered]
 
+    # Ensure uniqueness again before returning
+    df = _ensure_unique_columns(df)
     return df.reset_index(drop=True)
 
 
@@ -184,16 +104,6 @@ def normalize_cashflows(
 def _to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """
     Coerce list[dict] to DataFrame, handling edge cases.
-
-    Args:
-        rows: Input list; if dict with 'cashflows', flatten it.
-
-    Returns:
-        pd.DataFrame: With core columns if absent; renames 'value_date' → 'date'.
-
-    Notes:
-        Failsafe: Converts malformed dicts to {'row': str(r)} to avoid crashes.
-        Preserves all keys for schema flexibility.
     """
     if not isinstance(rows, list) or not rows:
         return pd.DataFrame(columns=["date", "currency", "amount"])
@@ -213,25 +123,7 @@ def _to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 def _standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Map common aliases → canonical names (case-insensitive).
-
-    Args:
-        df: Input DataFrame.
-
-    Returns:
-        pd.DataFrame: Renamed columns; core ensured (date/currency/amount=None); derived instrument_id/type.
-
-    Mapping Examples:
-        - 'ccy', 'curr' → 'currency'
-        - 'amt', 'notional', 'value' → 'amount'
-        - 'cp', 'counterparty' → 'counterparty_id'
-        - 'cashflow_date', 'maturity_date' → 'date'
-
-    Extensions:
-        - Derives 'instrument_id' via _derive_instrument_id if missing/all-NaN.
-        - Sets 'type'='' if absent; 'product' = 'type' if swapped.
-        - Adds 'direction'='', 'description'='' as needed.
     """
-    """Map common aliases -> canonical names."""
     colmap = {
         "ccy": "currency",
         "curr": "currency",
@@ -254,18 +146,16 @@ def _standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
         "direction_flag": "direction",
         "flow_direction": "direction",
         "cashflow_date": "date",
-        "maturity_date": "date",  # if preview cashflows were emitted at maturity
+        "maturity_date": "date",
     }
     keep = df.copy()
-    cols_lower = {c: c for c in df.columns}
 
-    # If someone used different capitalization (e.g., 'Ccy'), normalize via lowercase comparison
+    # case-insensitive mapping
     lower_to_actual = {c.lower(): c for c in df.columns}
     for alias, canon in colmap.items():
         if alias in df.columns:
             keep.rename(columns={alias: canon}, inplace=True)
         else:
-            # case-insensitive
             if alias.lower() in lower_to_actual:
                 keep.rename(columns={lower_to_actual[alias.lower()]: canon}, inplace=True)
 
@@ -274,8 +164,25 @@ def _standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
         if core not in keep.columns:
             keep[core] = None
 
-    # Normalize instrument_id (derive when missing)
-    if "instrument_id" not in keep.columns or keep["instrument_id"].isna().all():
+    # Normalize instrument_id (derive when missing OR all-NA)
+    need_instrument_id = False
+    if "instrument_id" not in keep.columns:
+        need_instrument_id = True
+    else:
+        col = keep["instrument_id"]
+        try:
+            is_all_na = bool(col.isna().all())
+        except Exception:
+            # defensive: if .isna().all() returns Series (rare), collapse
+            try:
+                is_all_na = bool(col.isna().all().all())
+            except Exception:
+                is_all_na = False
+        if is_all_na:
+            need_instrument_id = True
+
+    if need_instrument_id:
+        # apply row-by-row safe derivation for instrument ids
         keep["instrument_id"] = keep.apply(_derive_instrument_id, axis=1)
 
     # Normalize 'type' vs 'product'
@@ -298,26 +205,14 @@ def _standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
 def _derive_instrument_id(row: pd.Series) -> str:
     """
     Derive unique instrument_id if missing.
-
-    Args:
-        row: pd.Series with row data.
-
-    Returns:
-        str: Existing ID or derived 'PRODUCT-CCY-YYYYMMDD-SEQ' (SEQ=hash % 10000 for uniqueness).
-
-    Priority:
-        1. Existing: 'instrument_id', 'id', 'deal_id', 'trade_id', 'txn_id', 'tx_id'.
-        2. Fallback: Based on product/ccy/date + hash-seq.
-
-    Purpose:
-        Enables traceability in liquidity ladders without upstream IDs.
     """
-    # Try common fields first
     for k in ("instrument_id", "id", "deal_id", "trade_id", "txn_id", "tx_id"):
-        v = str(row.get(k, "") or "").strip()
-        if v:
-            return v
-    # Fall back: PRODUCT-CCY-YYYYMMDD-SEQ
+        try:
+            v = str(row.get(k, "") or "").strip()
+            if v:
+                return v
+        except Exception:
+            continue
     prod = str(row.get("product") or row.get("type") or "CF").upper()
     ccy = str(row.get("currency") or "USD").upper()
     dt = row.get("date")
@@ -326,7 +221,6 @@ def _derive_instrument_id(row: pd.Series) -> str:
         dtag = dts.strftime("%Y%m%d") if pd.notnull(dts) else "NA"
     except Exception:
         dtag = "NA"
-    # small hash from row content to avoid collisions
     seq = abs(hash(str(row.to_dict()))) % 10000
     return f"{prod}-{ccy}-{dtag}-{seq:04d}"
 
@@ -334,23 +228,8 @@ def _derive_instrument_id(row: pd.Series) -> str:
 def _to_float(series: pd.Series) -> pd.Series:
     """
     Best-effort conversion to float, handling commas and strings.
-
-    Args:
-        series: pd.Series of amounts (str/int/float).
-
-    Returns:
-        pd.Series: Floats; NaN for unparseable.
-
-    Parsing:
-        - Skips NaN/NONE/NULL.
-        - Removes commas: '1,234.56' → 1234.56.
-        - Regex extracts first num: '-$1,000 USD' → -1000.0.
-        - Scientific: '1e3' → 1000.0.
-
-    Notes:
-        Preserves signs; used pre-direction signing.
     """
-    if series.dtype.kind in ("f", "i"):
+    if getattr(series, "dtype", None) is not None and series.dtype.kind in ("f", "i"):
         return series.astype(float)
     def _coerce(x):
         if x is None:
@@ -361,7 +240,6 @@ def _to_float(series: pd.Series) -> pd.Series:
         if s == "" or s.upper() in {"NAN", "NONE", "NULL"}:
             return float("nan")
         s = s.replace(",", "")
-        # extract first number (handles "1,234.56 USD")
         m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
         if m:
             try:
@@ -375,15 +253,6 @@ def _to_float(series: pd.Series) -> pd.Series:
 def _to_timestamp(x: Union[str, date, datetime, None]) -> Optional[pd.Timestamp]:
     """
     Coerce to normalized pd.Timestamp (date-only).
-
-    Args:
-        x: str/date/datetime/None.
-
-    Returns:
-        pd.Timestamp or None: Normalized if valid.
-
-    Notes:
-        errors='coerce'; used for as_of filtering.
     """
     if x is None:
         return None
@@ -397,18 +266,248 @@ def _to_timestamp(x: Union[str, date, datetime, None]) -> Optional[pd.Timestamp]
 def _force_kv(r: Dict[str, Any]) -> Dict[str, Any]:
     """
     Defensive dict coercion for malformed rows.
-
-    Args:
-        r: Input dict (may have non-str keys).
-
-    Returns:
-        Dict[str, Any]: Str keys; values unchanged. Fallback {'row': str(r)} on error.
-
-    Purpose:
-        Prevents pd.DataFrame() crashes on bad data.
     """
-    """Very defensive: stringify keys and leave values as-is."""
     try:
         return {str(k): v for k, v in r.items()}
     except Exception:
         return {"row": str(r)}
+
+
+def _ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure DataFrame columns are unique. If duplicates exist, rename subsequent
+    occurrences to <col>__dupN where N starts at 1.
+
+    This preserves all columns and avoids pandas warnings and data omission
+    on df.to_dict(orient='records').
+    """
+    cols = list(df.columns)
+    seen = {}
+    new_cols: List[str] = []
+    for col in cols:
+        if col not in seen:
+            seen[col] = 1
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            # create a unique suffix
+            suffix = f"__dup{seen[col]-1}"
+            candidate = f"{col}{suffix}"
+            # avoid accidental collision
+            while candidate in seen:
+                seen[col] += 1
+                suffix = f"__dup{seen[col]-1}"
+                candidate = f"{col}{suffix}"
+            seen[candidate] = 1
+            new_cols.append(candidate)
+    # If nothing changed, return original df
+    if new_cols == cols:
+        return df
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
+# ---------------------------
+# Small CLI / debug entrypoint to reproduce errors directly
+# ---------------------------
+def main():
+    """
+    1) Attempts to read canonical data files from ../data (portfolio_view.json or counterparty_data.json).
+    2) Calls normalize_cashflows on the discovered cashflows and prints DataFrame info.
+    """
+    BASE = Path(__file__).resolve().parent
+    DATA_DIR = BASE / "data"
+    print(f"[INFO] cf_normalizer main running. data dir: {DATA_DIR}")
+
+    pv_path = DATA_DIR / "portfolio_view.json"
+    cp_path = DATA_DIR / "counterparty_data.json"
+    state_path = DATA_DIR / "state.json"
+
+    cashflows = None
+    as_of = None
+
+    try:
+        if pv_path.exists():
+            print(f"[INFO] Loading {pv_path}")
+            pv = json.loads(pv_path.read_text())
+            if isinstance(pv, dict) and pv.get("cashflows"):
+                cashflows = pv.get("cashflows")
+            elif isinstance(pv, dict) and pv.get("counterparties"):
+                cplist = pv.get("counterparties") or []
+                agg = []
+                for cp in cplist:
+                    if isinstance(cp, dict):
+                        cfs = cp.get("cashflows") or cp.get("cash_flows") or []
+                        if isinstance(cfs, list):
+                            agg.extend(cfs)
+                cashflows = agg
+            if isinstance(pv, dict) and pv.get("as_of"):
+                as_of = pv.get("as_of")
+        elif cp_path.exists():
+            print(f"[INFO] Loading {cp_path}")
+            cps = json.loads(cp_path.read_text())
+            agg = []
+            if isinstance(cps, list):
+                for cp in cps:
+                    if isinstance(cp, dict):
+                        cfs = cp.get("cashflows") or cp.get("cash_flows") or []
+                        if isinstance(cfs, list):
+                            agg.extend(cfs)
+            cashflows = agg
+        elif state_path.exists():
+            print(f"[INFO] Loading {state_path}")
+            st = json.loads(state_path.read_text())
+            if isinstance(st, dict) and st.get("cashflows"):
+                cashflows = st.get("cashflows")
+            elif isinstance(st, dict) and st.get("state") and isinstance(st.get("state"), dict):
+                inner = st.get("state")
+                if inner.get("cashflows"):
+                    cashflows = inner.get("cashflows")
+            if isinstance(st, dict) and (st.get("as_of") or (st.get("state") or {}).get("as_of")):
+                as_of = st.get("as_of") or (st.get("state") or {}).get("as_of")
+        else:
+            print("[WARN] No portfolio_view.json / counterparty_data.json / state.json found in data dir. Exiting.")
+            return
+
+        if not isinstance(cashflows, list) or not cashflows:
+            print("[WARN] No cashflows discovered (empty or not a list). Exiting.")
+            return
+
+        print(f"[INFO] Calling normalize_cashflows on {len(cashflows)} raw rows (as_of={as_of})")
+        df = normalize_cashflows(cashflows, portfolio_view=None, bank_profile=None, as_of=as_of, include_historical_cashflows=False)
+        print("[OK] normalize_cashflows returned DataFrame:")
+        try:
+            print(df.info())
+            print(df.head(10).to_string(index=False))
+        except Exception as e:
+            print("[WARN] exception while printing DataFrame info:", e)
+            traceback.print_exc()
+
+    except Exception as e:
+        print("[ERROR] normalize_cashflows raised an exception:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="Run cf_normalizer.normalize_cashflows on local data files for debugging.")
+    parser.add_argument("--data-dir", "-d", default=os.path.join(os.path.dirname(__file__), "data"),
+                        help="Directory containing portfolio_view.json / cashflow files (default: ./data next to this script)")
+    parser.add_argument("--print-sample", action="store_true", help="Print sample rows from normalized DataFrame")
+    parser.add_argument("--include-historical", action="store_true", help="Pass include_historical_cashflows=True to normalize (default False)")
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    if not data_dir.exists() or not data_dir.is_dir():
+        print(f"[ERROR] data directory does not exist: {data_dir}")
+        raise SystemExit(1)
+
+    # Find candidate JSONs and aggregate
+    candidates = []
+    for name in ("portfolio_view.json", "state.json", "portfolio_view_*.json"):
+        candidates.extend(sorted(data_dir.glob(name)))
+    candidates.extend(sorted(p for p in data_dir.glob("*cashflow*.json")))
+    candidates.extend(sorted(data_dir.glob("*.json")))
+
+    seen = set()
+    files = []
+    for p in candidates:
+        if str(p) not in seen:
+            files.append(p)
+            seen.add(str(p))
+
+    if not files:
+        print(f"[WARN] No JSON files found in {data_dir}")
+        raise SystemExit(0)
+
+    all_cashflows = []
+    portfolio_as_of = None
+
+    def try_load_json(path: Path):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as e:
+            print(f"[WARN] Failed to load {path}: {e}")
+            return None
+
+    for fpath in files:
+        print(f"[INFO] Loading {fpath}")
+        obj = try_load_json(fpath)
+        if obj is None:
+            continue
+
+        if isinstance(obj, dict) and "as_of" in obj and not portfolio_as_of:
+            portfolio_as_of = obj.get("as_of")
+
+        if isinstance(obj, list):
+            print(f"[INFO] Found top-level list in {fpath} (assuming cashflows, len={len(obj)})")
+            all_cashflows.extend(obj)
+            continue
+
+        cf = None
+        if isinstance(obj, dict):
+            if "cashflows" in obj and isinstance(obj["cashflows"], list):
+                cf = obj["cashflows"]
+                print(f"[INFO] Found 'cashflows' in {fpath} (len={len(cf)})")
+            elif "cashflows_preview" in obj:
+                cp = obj["cashflows_preview"]
+                if isinstance(cp, dict):
+                    if "baseline" in cp and isinstance(cp["baseline"], list):
+                        cf = cp["baseline"]
+                        print(f"[INFO] Found 'cashflows_preview'->'baseline' in {fpath} (len={len(cf)})")
+                    else:
+                        flattened = []
+                        for v in cp.values():
+                            if isinstance(v, list):
+                                flattened.extend(v)
+                        if flattened:
+                            cf = flattened
+                            print(f"[INFO] Flattened cashflows_preview lists in {fpath} (len={len(cf)})")
+                elif isinstance(cp, list):
+                    cf = cp
+                    print(f"[INFO] Found 'cashflows_preview' as list in {fpath} (len={len(cf)})")
+            elif "flows" in obj and isinstance(obj["flows"], list):
+                cf = obj["flows"]
+                print(f"[INFO] Found 'flows' in {fpath} (len={len(cf)})")
+            elif "rows" in obj and isinstance(obj["rows"], list):
+                cf = obj["rows"]
+                print(f"[INFO] Found 'rows' in {fpath} (len={len(cf)})")
+            elif "data" in obj and isinstance(obj["data"], list):
+                cf = obj["data"]
+                print(f"[INFO] Found 'data' in {fpath} (len={len(cf)})")
+
+        if cf:
+            all_cashflows.extend(cf)
+
+    print(f"[INFO] Total raw cashflow rows collected: {len(all_cashflows)}")
+
+    if not all_cashflows:
+        print("[WARN] No cashflows discovered (empty or not a list). Exiting.")
+        raise SystemExit(0)
+
+    try:
+        df = normalize_cashflows(all_cashflows, portfolio_view=None, bank_profile=None,
+                                 as_of=portfolio_as_of, include_historical_cashflows=bool(args.include_historical))
+
+        print(f"[INFO] normalize_cashflows returned DataFrame with shape: {getattr(df, 'shape', None)}")
+        try:
+            print("\n[INFO] DataFrame.dtypes:")
+            print(df.dtypes)
+            print("\n[INFO] DataFrame.info():")
+            df.info()
+        except Exception:
+            pass
+
+        if args.print_sample:
+            print("\n[INFO] Sample rows (up to 10):")
+            print(df.head(10).to_dict(orient="records"))
+
+    except Exception as exc:
+        print("[ERROR] Exception raised while normalizing cashflows:")
+        traceback.print_exc()
+        raise
