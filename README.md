@@ -46,7 +46,7 @@ The orchestrator runs the components in the following order (this is the sequenc
 
 1. `portfolio_aggregator`  → writes `portfolio_view.json`
 2. `state_builder`         → writes `state.json`
-3. `counterpart_aggregator`→ writes `portfolio_intel.json` (and/or `counterparty_data.json`)
+3. `counterpart_aggregator`→ writes `portfolio_intel.json` 
 4. `metrics`               → writes `baseline_metrics.json`
 5. `macro_market_data`     → writes `macro_data.json`
 6. `news_ai`               → writes `ai_news.json`
